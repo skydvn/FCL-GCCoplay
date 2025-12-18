@@ -146,7 +146,12 @@ class OursV2(Server):
                 # Optional: Final Eval after KD
                 print(f">>> [End of Task {task}] Final Evaluation after KD...")
                 self.eval(task=task, glob_iter=glob_iter, flag="global")
-
+            
+            
+            for client in self.clients:
+                client.move_to_next_task()
+                if client.current_task_id not in self.global_task_label_mapping:
+                    self.global_task_label_mapping[client.current_task_id] = client.current_labels
 
     def train_global_generator(self, available_labels):
         labels_list = list(available_labels)

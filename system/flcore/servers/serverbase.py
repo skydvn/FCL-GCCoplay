@@ -57,15 +57,16 @@ class Server(object):
         self.global_accuracy_matrix = []
         self.local_accuracy_matrix = []
 
-        if self.args.dataset == 'IMAGENET1k':
-            self.N_TASKS = 500
-        elif self.args.dataset == 'CIFAR100':
-            self.N_TASKS = 50
-        elif self.args.dataset == 'CIFAR10':
-            self.N_TASKS = 5
-        if self.args.nt is not None:
-            self.N_TASKS = self.args.num_classes // self.args.cpt
-
+        # if self.args.dataset == 'IMAGENET1k':
+        #     self.N_TASKS = 500
+        # elif self.args.dataset == 'CIFAR100':
+        #     self.N_TASKS = 50
+        # elif self.args.dataset == 'CIFAR10':
+        #     self.N_TASKS = 5
+        # if self.args.nt is not None:
+        #     self.N_TASKS = self.args.num_classes // self.args.cpt
+        self.N_TASKS = self.args.num_tasks
+        assert self.args.num_classes // self.args.cpt == self.N_TASKS 
         # FCL
         self.task_dict = {}
         self.current_task = 0
@@ -77,26 +78,126 @@ class Server(object):
 
         self.file_name = f"{self.args.algorithm}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 
-    def set_clients(self, clientObj):
+        self.client_task_sequences = []
         for i in range(self.num_clients):
-            print(f"Creating client {i} ...")
+            # Tạo danh sách Task ID từ 0 đến N_TASKS-1
+            sequence = list(range(self.N_TASKS))
+            # Hoán vị ngẫu nhiên để tạo tính Temporal Heterogeneity
+            random.shuffle(sequence) 
+            self.client_task_sequences.append(sequence)
+
+        # Theo dõi bước hiện tại trong lộ trình (curriculum step)
+        self.current_curriculum_step = 0
+
+        # Chia 100 class thành 5 cụm cố định
+        all_classes = list(range(self.num_classes))
+        # random.shuffle(all_classes) # Bỏ comment nếu muốn task 0 không nhất thiết là class 0-19
+        self.global_task_labels = {}
+        for t in range(self.N_TASKS):
+            self.global_task_labels[t] = all_classes[t*self.args.cpt : (t+1)*self.args.cpt]
+
+    def set_clients(self, clientObj):
+        self.global_task_label_mapping = {}
+        
+        # 1. Tạo Pool dữ liệu cho từng Task (Load 1 lần duy nhất mỗi Task)
+        task_data_pools = {}
+        print("--- Pre-loading and Shuffling Task Pools ---")
+        for tid in range(self.N_TASKS):
+            # Load toàn bộ 10.000 ảnh của Task ID này
+            # (Dùng client_id=0 hoặc -1 tùy read_func để lấy full task data)
             if self.args.dataset == 'IMAGENET1k':
-                train_data, label_info = read_client_data_FCL_imagenet1k(i, task=0, classes_per_task=self.args.cpt, count_labels=True)
+                read_func = read_client_data_FCL_imagenet1k
             elif self.args.dataset == 'CIFAR100':
-                train_data, label_info = read_client_data_FCL_cifar100(i, task=0, classes_per_task=self.args.cpt, count_labels=True)
+                read_func = read_client_data_FCL_cifar100
             elif self.args.dataset == 'CIFAR10':
-                train_data, label_info = read_client_data_FCL_cifar10(i, task=0, classes_per_task=self.args.cpt, count_labels=True)
+                read_func = read_client_data_FCL_cifar10
             else:
                 raise NotImplementedError("Not supported dataset")
+            full_task_data, label_info = read_func(0, task=tid, classes_per_task=self.args.cpt, count_labels=True)
+            
+            # Lưu trữ data và danh sách index đã xáo trộn
+            indices = list(range(len(full_task_data)))
+            random.shuffle(indices)
+            
+            task_data_pools[tid] = {
+                'dataset': full_task_data,
+                'indices': indices,
+                'labels': label_info['labels']
+            }
+            self.global_task_label_mapping[tid] = label_info['labels']
 
-            client = clientObj(self.args, id=i, train_data=train_data)
-            self.clients.append(client)
+        # 2. Phân phối dữ liệu cho từng Client
+        for i in range(self.num_clients):
+            # Xác định Client i đang ở bước đầu tiên của trình tự nào
+            initial_task_id = self.client_task_sequences[i][0]
+            pool = task_data_pools[initial_task_id]
+            
+            # 3. Tính toán số mẫu cho client này (Ví dụ: chia đều + nhiễu ngẫu nhiên)
+            # Giả sử 10.000 ảnh chia cho 10 client học task đó -> ~1000 ảnh/client
+            avg_samples = len(pool['dataset']) // (self.num_clients // self.N_TASKS + 1)
+            num_samples = random.randint(int(avg_samples * 0.5), int(avg_samples * 1.5))
+            
+            # Đảm bảo không lấy quá số lượng còn lại trong pool
+            num_samples = min(num_samples, len(pool['indices']))
+            
+            # Bốc thăm các chỉ số index (Không hoàn lại - No replacement)
+            chosen_indices = pool['indices'][:num_samples]
+            pool['indices'] = pool['indices'][num_samples:] # Loại bỏ các index đã dùng
+            
+            # Tạo Subset dataset cho client
+            client_train_data = torch.utils.data.Subset(pool['dataset'], chosen_indices)
 
-            # update classes so far & current labels
-            client.classes_so_far.extend(label_info['labels'])
-            client.current_labels.extend(label_info['labels'])
-            client.task_dict[0] = label_info['labels']
+            # 4. Khởi tạo Client
+            client = clientObj(self.args, id=i, train_data=client_train_data, task_sequence=self.client_task_sequences[i])
+            client.current_task_id = initial_task_id
+            client.task_dict[initial_task_id] = pool['labels']
+            client.current_labels = list(pool['labels'])
+            client.classes_so_far = list(pool['labels'])
             client.file_name = self.file_name
+            
+            self.clients.append(client)
+            print(f"Client {i:02d} | Task {initial_task_id} | Samples: {len(client_train_data)} | Labels: {pool['labels']}")
+
+        self.print_task_curriculum()
+
+    # def set_clients(self, clientObj):
+    #     self.global_task_label_mapping = self.global_task_labels
+
+    #     for i in range(self.num_clients):
+    #         print(f"Creating client {i} ...")
+    #         # Lấy Task ID thực tế từ trình tự ngẫu nhiên của client i
+    #         initial_task_id = self.client_task_sequences[i][0]
+    #         target_labels = self.global_task_labels[initial_task_id]
+    #         if self.args.dataset == 'IMAGENET1k':
+    #             read_func = read_client_data_FCL_imagenet1k
+    #         elif self.args.dataset == 'CIFAR100':
+    #             read_func = read_client_data_FCL_cifar100
+    #         elif self.args.dataset == 'CIFAR10':
+    #             read_func = read_client_data_FCL_cifar10
+    #         else:
+    #             raise NotImplementedError("Not supported dataset")
+
+    #         train_data, label_info = read_func(i, task=initial_task_id, classes_per_task=self.args.cpt, count_labels=True)
+
+    #         # 4. Khởi tạo Client
+    #         client = clientObj(self.args, id=i, train_data=train_data, task_sequence=self.client_task_sequences[i])
+            
+    #         # --- ÉP METADATA THEO CHUẨN SERVER ---
+    #         client.current_task_id = initial_task_id
+    #         client.file_name = self.file_name
+            
+    #         # QUAN TRỌNG: Gán nhãn chuẩn từ Server để các client cùng Task ID sẽ dùng chung Output Neurons
+    #         # Nếu hàm read_func trả về nhãn sai (trùng), ta ghi đè bằng nhãn chuẩn
+    #         actual_labels = list(target_labels) 
+            
+    #         client.task_dict[initial_task_id] = actual_labels
+    #         client.current_labels = actual_labels
+    #         client.classes_so_far = actual_labels
+            
+    #         self.clients.append(client)
+    #         print(f"Client {i:02d} | Task {initial_task_id} | Samples: {len(train_data)} | Classes: {len(label_info['labels'])}")
+
+    #     self.print_task_curriculum()
 
     def select_clients(self):
         if self.random_join_ratio:
@@ -186,7 +287,7 @@ class Server(object):
         num_samples = []
         tot_correct = []
         for c in self.clients:
-            ct, ns = c.test_metrics(task=task)
+            ct, ns = c.test_metrics(task)
             tot_correct.append(ct*1.0)
             num_samples.append(ns)
 
@@ -419,3 +520,32 @@ class Server(object):
         # Save model state_dict
         model_path = os.path.join(save_dir, model_filename)
         torch.save(local_model.state_dict(), model_path)
+
+    def print_task_curriculum(self):
+        print("\n" + "="*60)
+        print("CLIENT TASK CURRICULUM (Temporal Heterogeneity)")
+        print("="*60)
+        
+        # In trình tự của 5 client đầu tiên (để tránh spam nếu có 100 client)
+        for i in range(self.num_clients):
+            seq = self.client_task_sequences[i]
+            seq_str = " -> ".join([f"Task {tid}" for tid in seq])
+            print(f"Client {i:02d}: {seq_str}")
+        
+        print("\n" + "="*60)
+        print("TASK ID TO LABEL MAPPING (Spatial Heterogeneity Check)")
+        print("="*60)
+        
+        # Sắp xếp theo Task ID (0, 1, 2, 3, 4)
+        for tid in sorted(self.global_task_label_mapping.keys()):
+            labels = self.global_task_label_mapping[tid]
+            num_labels = len(labels)
+            
+                
+            print(f"Task ID {tid}: Total {num_labels:2d} classes | Preview: {labels}")
+            
+            # Kiểm tra nhanh: Nếu không phải 20 classes thì cảnh báo ngay
+            if num_labels != self.args.cpt:
+                print(f"   [!] WARNING: Task {tid} has {num_labels} classes, expected {self.args.cpt}!")
+
+        print("="*60 + "\n")
