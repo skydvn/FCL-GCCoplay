@@ -19,6 +19,7 @@ class FedAvg(Server):
     def train(self):
         # Vòng lặp qua từng Task (Continual Learning)
         for task in range(self.args.num_tasks):
+            torch.cuda.empty_cache()
             print(f"\n================ Current Task: {task} =================")
             self.current_task = task
             
@@ -33,6 +34,7 @@ class FedAvg(Server):
 
             # --- 2. VÒNG LẶP COMMUNICATION ROUNDS ---
             for i in range(self.global_rounds):
+                torch.cuda.empty_cache()
                 s_t = time.time()
                 glob_iter = i + self.global_rounds * task
                 
@@ -67,6 +69,8 @@ class FedAvg(Server):
                 self.send_models() 
                 # Hàm eval_task trong ServerBase sẽ tính toán và log Forgetting
                 self.eval_task(task=task, glob_iter=glob_iter, flag="global")
+
+            self.change_task()
 
     def _update_label_info(self):
         """Cập nhật danh sách nhãn hiện có trong hệ thống"""

@@ -159,19 +159,28 @@ class Client(object):
             param.data = new_param.data.clone()
 
     def test_metrics(self, task=None):
-        # Tự động gộp tất cả task đã học (spatial + temporal)
-        # Chúng ta bỏ qua tham số 'task' truyền từ server vì mỗi client có lịch sử riêng
-        history_tasks = self.tasks_seen_so_far + [self.current_task_id]
+        self.model.eval()
         
-        test_datasets = [self.load_test_data(task=tid) for tid in history_tasks]
-        
+        # Nếu truyền task cụ thể (ví dụ: Task 0, 1, 2, 3, hoặc 4)
+        if task is not None:
+            # Kiểm tra xem client này ĐÃ TỪNG học task này chưa
+            if task not in self.tasks_seen_so_far and task != self.current_task_id:
+                # Nếu chưa học, trả về (0, 0) để không đóng góp vào kết quả trung bình của task đó
+                return 0, 0
+            
+            # Chỉ nạp tập test của đúng Task ID đó
+            test_datasets = [self.load_test_data(task=task)]
+        else:
+            # Nếu không truyền task, mặc định test trên toàn bộ những gì đã học (để log tiến độ chung)
+            history_tasks = self.tasks_seen_so_far + [self.current_task_id]
+            test_datasets = [self.load_test_data(task=tid) for tid in history_tasks]
+
         testloader = DataLoader(
             ConcatDataset(test_datasets),
             batch_size=self.batch_size,
             shuffle=False
         )
 
-        self.model.eval()
         test_acc, test_num = 0, 0
         with torch.no_grad():
             for x, y in testloader:
@@ -366,6 +375,29 @@ class Client(object):
             return True
         return False
 
+# Bổ sung vào class Client
+    def get_feature_embeddings(self, model_to_use=None):
+        """Trích xuất feature (output của layer trước FC) để vẽ t-SNE."""
+        model = model_to_use if model_to_use is not None else self.model
+        model.eval()
+        
+        # Lấy tất cả task đã học + task hiện tại
+        history = self.tasks_seen_so_far + [self.current_task_id]
+        test_datasets = [self.load_test_data(tid) for tid in history]
+        loader = DataLoader(ConcatDataset(test_datasets), batch_size=self.batch_size, shuffle=False)
+        
+        feats, labels = [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                # Giả sử mô hình có phần 'base' trích xuất feature
+                # Nếu dùng ResNet/CNN chuẩn, thường là model.base(x)
+                f = model.base(x).view(x.size(0), -1) 
+                feats.append(f.cpu())
+                labels.append(y)
+        return torch.cat(feats), torch.cat(labels)
+
+    
     # def proto_eval(self, model, task, round):
     #     save_dir = os.path.join("pca_eval", self.file_name, "local")
     #     if not os.path.exists(save_dir):
