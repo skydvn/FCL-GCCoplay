@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import statistics
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from utils.data_utils import *
 
 from flcore.trainmodel.models import *
@@ -16,7 +16,7 @@ class Client(object):
     Base class for clients in federated learning.
     """
 
-    def __init__(self, args, id, train_data, **kwargs):
+    def __init__(self, args, id, train_data, task_sequence, **kwargs):
         torch.manual_seed(0)
         self.t_angle_after = 0
 
@@ -72,6 +72,10 @@ class Client(object):
         self.last_copy = None
         self.if_last_copy = False
         self.args = args
+        self.task_sequence = task_sequence
+        self.curriculum_step = 0
+        self.current_task_id = task_sequence[0]
+        self.tasks_seen_so_far = []
 
     def next_task(self, train, label_info = None, if_label = True):
         
@@ -139,7 +143,7 @@ class Client(object):
         elif self.args.dataset == 'CIFAR10':
             test_data = read_client_data_FCL_cifar10(self.id, task=task, classes_per_task=self.args.cpt, count_labels=False, train=False)
 
-        return DataLoader(test_data, batch_size, drop_last=False, shuffle=True)  
+        return test_data  
 
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.model.parameters()):
@@ -154,23 +158,25 @@ class Client(object):
         for param, new_param in zip(model.parameters(), new_params):
             param.data = new_param.data.clone()
 
-    def test_metrics(self, task):
-        testloader = self.load_test_data(task=task)
+    def test_metrics(self, task=None):
+        # Tự động gộp tất cả task đã học (spatial + temporal)
+        # Chúng ta bỏ qua tham số 'task' truyền từ server vì mỗi client có lịch sử riêng
+        history_tasks = self.tasks_seen_so_far + [self.current_task_id]
+        
+        test_datasets = [self.load_test_data(task=tid) for tid in history_tasks]
+        
+        testloader = DataLoader(
+            ConcatDataset(test_datasets),
+            batch_size=self.batch_size,
+            shuffle=False
+        )
 
         self.model.eval()
-
-        test_acc = 0
-        test_num = 0
-        
+        test_acc, test_num = 0, 0
         with torch.no_grad():
             for x, y in testloader:
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
-                y = y.to(self.device)
+                x, y = x.to(self.device), y.to(self.device)
                 output = self.model(x)
-
                 test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
                 test_num += y.shape[0]
         
@@ -327,6 +333,38 @@ class Client(object):
 
         mse = F.mse_loss(params1, params2)
         return mse.item()
+
+    def move_to_next_task(self):
+        # 1. Lưu task hiện tại vào lịch sử trước khi nhảy sang task mới
+        if self.current_task_id not in self.tasks_seen_so_far:
+            self.tasks_seen_so_far.append(self.current_task_id)
+
+        # 2. Chuyển sang bước tiếp theo trong lộ trình (Temporal Heterogeneity)
+        self.curriculum_step += 1
+        
+        if self.curriculum_step < len(self.task_sequence):
+            # Lấy Task ID tiếp theo từ trình tự riêng của client này
+            next_id = self.task_sequence[self.curriculum_step]
+            self.current_task_id = next_id
+
+            # 3. Tận dụng logic nạp dữ liệu (giống trong load_train_data của bạn)
+            # Ở đây ta cần lấy 'train_data' gốc và 'label_info'
+            if self.args.dataset == 'IMAGENET1k':
+                train_data, label_info = read_client_data_FCL_imagenet1k(self.id, task=next_id, classes_per_task=self.args.cpt, count_labels=True, train=True)
+            elif self.args.dataset == 'CIFAR100':
+                train_data, label_info = read_client_data_FCL_cifar100(self.id, task=next_id, classes_per_task=self.args.cpt, count_labels=True, train=True)
+            elif self.args.dataset == 'CIFAR10':
+                train_data, label_info = read_client_data_FCL_cifar10(self.id, task=next_id, classes_per_task=self.args.cpt, count_labels=True, train=True)
+
+            # 4. Gọi hàm next_task có sẵn của bạn để đồng bộ mô hình và nhãn
+            # Hàm này của bạn sẽ cập nhật self.train_data, self.model_copy, v.v.
+            self.next_task(train=train_data, label_info=label_info, if_label=True)
+            
+            # Cập nhật thêm task_dict theo ID thực tế để quản lý
+            self.task_dict[next_id] = label_info['labels']
+            
+            return True
+        return False
 
     # def proto_eval(self, model, task, round):
     #     save_dir = os.path.join("pca_eval", self.file_name, "local")
