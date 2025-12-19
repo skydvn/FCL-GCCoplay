@@ -34,7 +34,7 @@ class FedAvg(Server):
 
             # --- 2. VÒNG LẶP COMMUNICATION ROUNDS ---
             for i in range(self.global_rounds):
-                torch.cuda.empty_cache()
+                
                 s_t = time.time()
                 glob_iter = i + self.global_rounds * task
                 
@@ -59,8 +59,7 @@ class FedAvg(Server):
                 self.receive_models() 
                 self.aggregate_parameters()
                 
-                self.Budget.append(time.time() - s_t)
-                print(f"Round {i} Time: {self.Budget[-1]:.2f}s")
+                
 
             # --- 3. ĐÁNH GIÁ CUỐI TASK (FORGETTING RATE) ---
             if self.args.offlog:
@@ -70,7 +69,7 @@ class FedAvg(Server):
                 # Hàm eval_task trong ServerBase sẽ tính toán và log Forgetting
                 self.eval_task(task=task, glob_iter=glob_iter, flag="global")
 
-            self.change_task()
+            self.change_task(task, (task + 1)*self.global_rounds)
 
     def _update_label_info(self):
         """Cập nhật danh sách nhãn hiện có trong hệ thống"""

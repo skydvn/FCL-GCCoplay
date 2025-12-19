@@ -4,13 +4,11 @@ import torch.nn.functional as F
 import copy
 import numpy as np
 from torch import nn, optim
-from tqdm import tqdm
-
 from flcore.servers.serverbase import Server
 from flcore.clients.ours_v2 import clientOursV2
 
 # ==========================================
-# 1. GENERATOR CLASS (Fixed with Label Emb)
+# 1. GENERATOR CLASS 
 # ==========================================
 class Generator(nn.Module):
     def __init__(self, nz=100, ngf=64, img_size=32, nc=3, num_classes=100, device=None):
@@ -18,11 +16,7 @@ class Generator(nn.Module):
         self.params = (nz, ngf, img_size, nc, num_classes) 
         self.init_size = img_size // 4
         self.device = device
-        
-        # Embed label into vector of size nz
         self.label_emb = nn.Embedding(num_classes, nz)
-
-        # Input is noise (nz) + label (nz)
         self.l1 = nn.Sequential(nn.Linear(nz * 2, ngf * 2 * self.init_size ** 2))
 
         self.conv_blocks = nn.Sequential(
@@ -82,6 +76,8 @@ class OursV2(Server):
             num_classes=args.num_classes,
         ).to(self.device)
 
+        # [NEW] Placeholder for the Anchor (Previous Generator)
+        self.prev_generator = None
         self.has_initialized_generator = False 
         
         # Hyperparameters
@@ -93,131 +89,167 @@ class OursV2(Server):
         self.T = getattr(args, 'T', 2.0)             
         
         self.set_clients(clientOursV2)
-        print(f"Server Initialized (Ours + Server KD). Generator Config: nz={self.nz}")
+        print(f"Server Initialized. Generator Config: nz={self.nz}")
 
     def train(self):
         for task in range(self.args.num_tasks):
             print(f"\n================ Current Task: {task} =================")
             self.current_task = task
             self._update_label_info()
-            
             if task > 0: self._load_task_data_for_clients(task)
 
+            # [ANCHOR SETUP] Before starting a new task (if > 0), snapshot the generator
+            if task > 0 and self.prev_generator is None:
+                print(f">>> [Task {task}] Creating Anchor from Previous Task Generator...")
+                self.prev_generator = self.global_generator.clone()
+                self.prev_generator.eval()
+                for p in self.prev_generator.parameters(): p.requires_grad = False
+
             # -----------------------------------------------
-            # PHASE 1: Standard Federated Learning (FedAvg)
+            # Loop Rounds
             # -----------------------------------------------
             for i in range(self.global_rounds):
                 s_t = time.time()
                 glob_iter = i + self.global_rounds * task
                 
-                # 1. Send Models (Classifier + Generator)
+                # 1. Send Models
                 self.selected_clients = self.select_clients()
                 self.send_models() 
+
+                if i % self.eval_gap == 0:
+                    print(f"\n-------------Round number: {i}-------------")
+                    self.eval(task=task, glob_iter=glob_iter, flag="global")
 
                 # 2. Local Training
                 for client in self.selected_clients:
                     client.train(task=task)
 
-                # 3. Receive Client Models
+                if i % self.eval_gap == 0:
+                    self.eval(task=task, glob_iter=glob_iter, flag="local")
+
+                # 3. Receive Models
                 self.receive_models() 
                 
-                # 4. Aggregate Classifiers (FedAvg)
+                # -----------------------------------------------
+                # 4. Aggregation Logic (Task 0 vs Task > 0)
+                # -----------------------------------------------
+                
+                # Step A: Always do FedAvg (Base Aggregation)
                 self.aggregate_parameters()
+
+                # Step B: If Task > 0, we ADD Distillation during the rounds
+                # "I want to use distillation... combine this with averaging"
+                if task > 0 and i < self.global_rounds - 1:
+                    # Run a lighter version of KD (e.g., 50 steps) to mix past knowledge
+                    # into the current FedAvg weights
+                    self.train_global_classifier(self.available_labels_current, steps=50)
+
+                # -----------------------------------------------
+                # 5. End of Task Logic (Round R)
+                # -----------------------------------------------
+                if i == self.global_rounds - 1:
+                    print(f"\n>>> [Round R] End of Task {task} detected.")
+                    
+                    # A. Train Generator
+                    # Task 0: Train normally. 
+                    # Task > 0: Train with Anchor.
+                    use_anchor = (task > 0)
+                    self.train_global_generator(self.available_labels_current, use_anchor=use_anchor)
+
+                    # B. Train Classifier (Full Distillation)
+                    # Now that Generator is updated, distill knowledge into Classifier
+                    self.train_global_classifier(self.available_labels_current, steps=self.k_steps)
+
+                    # C. Update Anchor for NEXT task
+                    # We take the freshly trained generator and save it as the new anchor
+                    self.prev_generator = self.global_generator.clone()
+                    self.prev_generator.eval()
+                    for p in self.prev_generator.parameters(): p.requires_grad = False
                 
                 self.Budget.append(time.time() - s_t)
-                
-                # Evaluation
-                if i % self.eval_gap == 0:
-                    self.eval(task=task, glob_iter=glob_iter, flag="global")
+                print(f"Round {i} Time: {self.Budget[-1]:.2f}s")
 
-            # -----------------------------------------------
-            # PHASE 2: End of Task Processing (Distillation)
-            # -----------------------------------------------
-            # We use the models uploaded in the very last round as "Teachers"
-            if len(self.uploaded_models) > 0:
-                print(f"\n>>> [End of Task {task}] Performing Knowledge Distillation & Generator Training...")
-                
-                # A. Train Generator (GAN Loss: Fooling Ensemble)
-                self.train_global_generator(self.available_labels_current)
+            # Final Eval
+            if self.args.offlog:
+                print(f"\n>>> Task {task} Finished. Evaluating Forgetting Rate...")
+                # Gửi model mới nhất xuống client để test
+                self.send_models() 
+                # Hàm eval_task trong ServerBase sẽ tính toán và log Forgetting
+                self.eval_task(task=task, glob_iter=glob_iter, flag="global")
 
-                # B. Train Global Classifier (KL Loss: Learning from Ensemble)
-                self.train_global_classifier(self.available_labels_current)
-                
-                # Optional: Final Eval after KD
-                print(f">>> [End of Task {task}] Final Evaluation after KD...")
-                self.eval(task=task, glob_iter=glob_iter, flag="global")
-            
-            
-            for client in self.clients:
-                client.move_to_next_task()
-                if client.current_task_id not in self.global_task_label_mapping:
-                    self.global_task_label_mapping[client.current_task_id] = client.current_labels
+            self.change_task(task, (task + 1)*self.global_rounds)
 
-    def train_global_generator(self, available_labels):
+
+    def train_global_generator(self, available_labels, use_anchor=False):
         labels_list = list(available_labels)
         if len(labels_list) == 0: return
 
         if not self.has_initialized_generator:
-            print(">>> [Init] Generator Weights...")
             self.global_generator.apply(weight_init)
             self.has_initialized_generator = True
         
         self.global_generator.train()
         
-        # Freeze Teachers (Ensemble of Clients)
+        # Freeze Teachers
         teachers = self.uploaded_models
-        for t in teachers:
-            t.eval()
-            for p in t.parameters(): p.requires_grad = False
+        for t in teachers: t.eval(); 
+        for p in t.parameters(): p.requires_grad = False
 
         optimizer_g = optim.Adam(self.global_generator.parameters(), lr=self.g_lr)
         criterion_gan = nn.CrossEntropyLoss()
+        mse_loss = nn.MSELoss() # [NEW] For Anchor
+        
+        # Anchor Strength
+        alpha = 10.0 
 
-        print(f"   -> Training Generator for {self.g_steps} steps...")
+        print(f"   -> Training Generator (Anchor={use_anchor})...")
         for step in range(self.g_steps):
-            # Sample Z & Labels
+            optimizer_g.zero_grad()
+            
+            # Sample
             labels = np.random.choice(labels_list, self.batch_size_gen)
             labels = torch.tensor(labels).long().to(self.device)
             z = torch.randn(self.batch_size_gen, self.nz).to(self.device)
 
             gen_imgs = self.global_generator(z, labels)
 
-            # Ensemble Loss
+            # 1. Classification Loss (Teachers)
             total_loss = 0
             for teacher in teachers:
                 preds = teacher(gen_imgs)
                 total_loss += criterion_gan(preds, labels)
-            
             loss_g = total_loss / len(teachers)
 
-            optimizer_g.zero_grad()
+            # 2. [NEW] Anchor Loss
+            if use_anchor and self.prev_generator is not None:
+                with torch.no_grad():
+                    # Generate images using the OLD generator with SAME noise
+                    anchor_imgs = self.prev_generator(z, labels)
+                
+                # MSE ensures structural similarity (prevents forgetting old classes)
+                loss_anchor = mse_loss(gen_imgs, anchor_imgs)
+                loss_g += alpha * loss_anchor
+
             loss_g.backward()
             optimizer_g.step()
 
-    def train_global_classifier(self, available_labels):
+    def train_global_classifier(self, available_labels, steps=100):
         labels_list = list(available_labels)
         if len(labels_list) == 0: return
 
-        # 1. Enable Training Mode for Student
         self.global_model.train() 
+        for param in self.global_model.parameters(): param.requires_grad = True
+        self.global_generator.eval()
 
-        # 2. CRITICAL FIX: Unfreeze Global Model Parameters
-        for param in self.global_model.parameters():
-            param.requires_grad = True
-
-        self.global_generator.eval() # Generator is frozen here
-
-        # Freeze Teachers (Ensemble)
         teachers = self.uploaded_models
-        for t in teachers:
-            t.eval()
-            for p in t.parameters(): p.requires_grad = False
+        for t in teachers: t.eval(); 
+        for p in t.parameters(): p.requires_grad = False
             
         optimizer_c = optim.Adam(self.global_model.parameters(), lr=self.c_lr)
         criterion_kd = nn.KLDivLoss(reduction='batchmean')
 
-        print(f"   -> Distilling into Global Classifier for {self.k_steps} steps...")
-        for step in range(self.k_steps):
+        # print(f"   -> Distilling into Classifier ({steps} steps)...")
+        for step in range(steps):
             labels = np.random.choice(labels_list, self.batch_size_gen)
             labels = torch.tensor(labels).long().to(self.device)
             z = torch.randn(self.batch_size_gen, self.nz).to(self.device)
@@ -225,15 +257,14 @@ class OursV2(Server):
             with torch.no_grad():
                 gen_imgs = self.global_generator(z, labels)
 
-            # Teacher Output (Ensemble)
+            # Teacher Ensemble
             teacher_logits_sum = 0
             with torch.no_grad():
                 for teacher in teachers:
                     teacher_logits_sum += teacher(gen_imgs)
-            
             teacher_avg_logits = teacher_logits_sum / len(teachers)
 
-            # Student Output
+            # Student
             student_logits = self.global_model(gen_imgs)
 
             # KL Loss
@@ -258,6 +289,7 @@ class OursV2(Server):
         self.available_labels_current = available_labels
 
     def _load_task_data_for_clients(self, task):
+        # (Assuming your imports are correct here)
         if self.args.dataset == 'IMAGENET1k':
             from utils.data_utils import read_client_data_FCL_imagenet1k as read_func
         elif 'CIFAR100' in self.args.dataset:
