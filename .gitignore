@@ -5,6 +5,7 @@ dataset/imagenet1k-classes
 dataset/imagenet1k_224_classes
 dataset/synthetic_data
 dataset/imagenet_resize
+dataset/class_order
 wandb
 test.py
 output_fedweit
@@ -17,3 +18,4 @@ Proto
 draw
 ***.out
 .ipynb_checkpoints
+dataset/class_order/class_order_cifar100_100clients.npy
