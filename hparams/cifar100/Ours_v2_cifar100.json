@@ -15,7 +15,7 @@
 
     "optimizer": "adam",
     "batch_size": 32,
-    "local_learning_rate": 0.001,
+    "local_learning_rate": 0.1,
     "learning_rate_decay": true,
     "learning_rate_decay_gamma": 0.99,
 
@@ -34,7 +34,7 @@
     "num_tasks": 5,
     "cpt": 20,
 
-    "g_lr": 0.001,
+    "g_lr": 0.01,
     "g_steps": 100,
     "replay_weight": 1.0,
     "nz": 256,
