@@ -6,7 +6,8 @@ import numpy as np
 from torch import nn, optim
 from flcore.servers.serverbase import Server
 from flcore.clients.ours_v2 import clientOursV2
-from flcore.utils_core.target_utils import Generator
+from flcore.utils_core.target_utils import *
+from utils.data_utils import read_client_data_FCL_cifar100, read_client_data_FCL_imagenet1k, read_client_data_FCL_cifar10
 
 def weight_init(m):
     classname = m.__class__.__name__
@@ -56,19 +57,68 @@ class OursV2(Server):
         self.g_steps = getattr(args, 'g_steps', 100) 
         self.k_steps = getattr(args, 'k_steps', 200) # Tăng step distillation lên chút
         self.batch_size_gen = 64
-        self.T = getattr(args, 'T', 2.0)             
-        
+        self.T = getattr(args, 'T', 2.0)        
+
+        self.optimizer_g = optim.Adam(self.global_generator.parameters(), lr=self.g_lr, betas=(0.5, 0.999))
+        self.optimizer_c = optim.Adam(self.global_model.parameters(), lr=self.c_lr)
+
+        self.scheduler_g = optim.lr_scheduler.MultiStepLR(self.optimizer_g, milestones=[30, 80], gamma=0.1)
+        self.scheduler_c = optim.lr_scheduler.MultiStepLR(self.optimizer_c, milestones=[30, 80], gamma=0.1)
+
+
         self.set_clients(clientOursV2)
         print(f"Server Initialized. Generator Config: ImgSize={self.img_size}, nz={self.nz}, Device={self.device}")
 
     def train(self):
         for task in range(self.args.num_tasks):
+
             print(f"\n================ Current Task: {task} =================")
-            self.current_task = task
-            # -----------------------------------------------
-            # Loop Rounds
-            # -----------------------------------------------
-            self.send_models()
+            if task == 0:
+                 # update labels info. for the first task
+                available_labels = set()
+                available_labels_current = set()
+                available_labels_past = set()
+                for u in self.clients:
+                    available_labels = available_labels.union(set(u.classes_so_far))
+                    available_labels_current = available_labels_current.union(set(u.current_labels))
+                # print("ahihi " + str(len(available_labels_current)))
+                for u in self.clients:
+                    u.available_labels = list(available_labels)
+                    u.available_labels_current = list(available_labels_current)
+                    u.available_labels_past = list(available_labels_past)
+
+            else:
+                self.current_task = task
+                
+                torch.cuda.empty_cache()
+                for i in range(len(self.clients)):
+                    
+                    if self.args.dataset == 'IMAGENET1k':
+                        train_data, label_info = read_client_data_FCL_imagenet1k(i, task=task, classes_per_task=self.args.cpt, count_labels=True)
+                    elif self.args.dataset == 'CIFAR100':
+                        train_data, label_info = read_client_data_FCL_cifar100(i, task=task, classes_per_task=self.args.cpt, count_labels=True)
+                    elif self.args.dataset == 'CIFAR10':
+                        train_data, label_info = read_client_data_FCL_cifar10(i, task=task, classes_per_task=self.args.cpt, count_labels=True)
+                    else:
+                        raise NotImplementedError("Not supported dataset")
+
+                    # update dataset
+                    self.clients[i].next_task(train_data, label_info) # assign dataloader for new data
+                    # print(self.clients[i].task_dict)
+
+                # update labels info.
+                available_labels = set()
+                available_labels_current = set()
+                available_labels_past = self.clients[0].available_labels
+                for u in self.clients:
+                    available_labels = available_labels.union(set(u.classes_so_far))
+                    available_labels_current = available_labels_current.union(set(u.current_labels))
+
+                for u in self.clients:
+                    u.available_labels = list(available_labels)
+                    u.available_labels_current = list(available_labels_current)
+                    u.available_labels_past = list(available_labels_past)
+
             for i in range(self.global_rounds):
                 print(f"\n-------------Round number: {i}-------------")
                 s_t = time.time()
@@ -76,10 +126,18 @@ class OursV2(Server):
                 
                 # 1. Send Models
                 self.selected_clients = self.select_clients() 
-                    
+                
+                self.eval(task=task, glob_iter=glob_iter, flag="global")
+
                 # 2. Local Training
                 for client in self.selected_clients:
-                    client.train(task=self.client_task_sequences[client.id][task])
+                    client.train(task=task)
+                if i % self.eval_gap == 0:
+                    self.eval(task=task, glob_iter=glob_iter, flag="local")
+                self.receive_models()
+
+                self.train_global_generator() # Updates Generator
+                self.aggregate_parameters()
                 self.eval(task=task, glob_iter=glob_iter, flag="local")
                 self.Budget.append(time.time() - s_t)
                 print(f"Round {i} Time: {self.Budget[-1]:.2f}s")
@@ -91,7 +149,7 @@ class OursV2(Server):
             self.eval(task=task, glob_iter=glob_iter, flag="global")
             self.eval_task(task=task, glob_iter=task, flag="global")
 
-            self.change_task(task, (task + 1)*self.global_rounds)
+            # self.change_task(task, (task + 1)*self.global_rounds)
 
 
     
@@ -99,102 +157,122 @@ class OursV2(Server):
     def train_global_generator(self):
         print(f"[Server-side] Start training Generator")
         
-        # --- 1. Label Setup ---
-        available_labels = []
-        for _, v in self.client_info_dict.items():
-            available_labels.extend(v["label"])
-        
-        # Clean labels
-        try:
-            labels_list = [int(x) for x in set(available_labels)]
-        except ValueError:
-            print("Error: Labels must be convertible to integers.")
-            return
+        # --- 1. Label & Model Preparation ---
+        # We process client labels once here to ensure they are standard Numpy arrays 
+        # (Fixes the mismatch between Tensor/List/Numpy that causes 0 loss)
+        processed_client_labels = {}
+        all_labels_set = set()
 
+        for client_id, info in self.client_info_dict.items():
+            raw_labels = info["label"]
+            
+            # 1. Handle Torch Tensors
+            if isinstance(raw_labels, torch.Tensor):
+                clean_labels = raw_labels.cpu().numpy().astype(int)
+            
+            # 2. Handle Lists (which might contain Tensors)
+            elif isinstance(raw_labels, list):
+                if len(raw_labels) > 0 and isinstance(raw_labels[0], torch.Tensor):
+                    clean_labels = np.array([x.item() for x in raw_labels], dtype=int)
+                else:
+                    clean_labels = np.array(raw_labels, dtype=int)
+            
+            # 3. FIX: Handle Sets (This is where your error happened)
+            elif isinstance(raw_labels, set):
+                clean_labels = np.array(list(raw_labels), dtype=int)
+                
+            # 4. Fallback for other iterables
+            else:
+                clean_labels = np.array(list(raw_labels), dtype=int)
+            
+            processed_client_labels[client_id] = clean_labels
+            all_labels_set.update(clean_labels.tolist())
+
+            # Optimization: Set teacher models to eval/frozen ONCE outside the loop
+            info["model"].eval()
+            for param in info["model"].parameters():
+                param.requires_grad = False
+
+        labels_list = list(all_labels_set)
         if len(labels_list) == 0:
-            print("No labels found. Skipping generator training.")
+            print("[Server-side] No labels found. Skipping generator training.")
             return
 
-        # --- 2. Model Setup ---
+        print(f"[Server-side] Generator training on {len(labels_list)} unique labels with {labels_list}.")
+
+        # --- 2. Generator Setup ---
         self.global_generator.train()
-        optimizer_g = optim.Adam(self.global_generator.parameters(), lr=self.g_lr, betas=(0.5, 0.999))
         criterion_ce = nn.CrossEntropyLoss()
         mse_loss = nn.MSELoss() 
         alpha = 10.0 
-        
+
         # --- 3. Training Loop ---
         for step in range(self.g_steps):
-            optimizer_g.zero_grad()
+            self.optimizer_g.zero_grad()
             
-            # Sample
+            # A. Sample Noise and Labels
             selected_labels = np.random.choice(labels_list, self.batch_size_gen)
             labels_tensor = torch.tensor(selected_labels, dtype=torch.long).to(self.device)
             z = torch.randn(self.batch_size_gen, self.nz).to(self.device)
 
-            # Generate (Gradient starts here)
+            # B. Generate Images
             gen_imgs = self.global_generator(z, labels_tensor)
 
-            # --- Classification Loss ---
-            total_ce_loss = 0  # <--- Defined here
+            # C. Classification Loss (Teacher Feedback)
+            total_ce_loss = torch.tensor(0.0, device=self.device)
             valid_teachers_count = 0
             
             for client_id, info in self.client_info_dict.items():
                 teacher_model = info["model"]
-                teacher_labels = info["label"] 
+                teacher_labels = processed_client_labels[client_id] # Use the pre-cleaned numpy array
 
+                # Boolean mask: True if the selected label exists in this teacher's dataset
                 mask = np.isin(selected_labels, teacher_labels)
                 
                 if mask.sum() > 0:
                     valid_teachers_count += 1
-                    mask_tensor = torch.tensor(mask).to(self.device)
+                    mask_tensor = torch.tensor(mask, device=self.device)
                     
+                    # Filter: Only pass images corresponding to labels this teacher knows
                     relevant_imgs = gen_imgs[mask_tensor]
                     relevant_labels = labels_tensor[mask_tensor]
                     
-                    teacher_model.eval() 
-                    for param in teacher_model.parameters():
-                        param.requires_grad = False
-                    
+                    # Teacher Prediction
                     preds = teacher_model(relevant_imgs)
                     
-                    # --- FIX IS HERE ---
-                    # WAS: total_loss += ... (Wrong variable name)
-                    # NOW: total_ce_loss += ...
+                    # Accumulate Loss
                     total_ce_loss += criterion_ce(preds, relevant_labels)
 
-            # Initialize loss_g safely
+            # D. Combine Losses
             if valid_teachers_count > 0:
-                loss_g = total_ce_loss / valid_teachers_count
+                loss_g = total_ce_loss
             else:
-                # If no teachers found for this batch, loss is 0.
-                # Use requires_grad=True to prevent crash, effectively a "no-op" update
+                # Fallback: maintain graph connectivity but 0 value
                 loss_g = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            # --- Anchor Loss ---
+            # E. Anchor Loss (Regularization with previous generator)
             if self.prev_generator is not None:
                 self.prev_generator.eval()
+                # Ensure prev_generator is frozen (safety check)
                 for param in self.prev_generator.parameters():
                     param.requires_grad = False
                     
-                # anchor_imgs must be detached from graph (no_grad)
-                anchor_imgs = self.prev_generator(z, labels_tensor)
+                with torch.no_grad():
+                    anchor_imgs = self.prev_generator(z, labels_tensor)
                 
                 loss_anchor = mse_loss(gen_imgs, anchor_imgs)
                 loss_g = loss_g + alpha * loss_anchor 
-                # Note: 'loss_g + ...' creates a new tensor node with grad history
 
-            # --- Backprop ---
-            print(f"[Server-side] Loss of Generator at step {step}: {loss_g}")
-            if loss_g.requires_grad:
-                loss_g.backward()
-                optimizer_g.step()
-            else:
-                # This should rarely happen now
-                print(f"[Server-side] Warning: No gradients flow. (Teachers: {valid_teachers_count})")
+            # F. Backpropagation
+            loss_g.backward()
+            self.optimizer_g.step()
+            self.scheduler_g.step()
+            # Optional: Print periodically instead of every step
+            if step % 10 == 0:
+                print(f"[Server-side] Generator update: Step {step}: Loss={loss_g.item():.4f} | Teachers Used={valid_teachers_count} | Lr: {self.optimizer_g.param_groups[0]['lr']}")
         
-        # Update Anchor (Do this at end of TASK, not here if you call this every round)
+        # --- 4. Update Anchor ---
         self.prev_generator = copy.deepcopy(self.global_generator)
-        
 
     def train_global_classifier(self, steps=100):
         print(f"[Server-side] Start training Global Classifier")
@@ -210,12 +288,8 @@ class OursV2(Server):
         
         # 2. Setup Generator (Fixed)
         self.global_generator.eval()
-
-        optimizer_c = optim.Adam(self.global_model.parameters(), lr=self.c_lr)
-        criterion_kd = nn.KLDivLoss(reduction='batchmean')
-
         for step in range(steps):
-            optimizer_c.zero_grad()
+            self.optimizer_c.zero_grad()
 
             # --- A. Generate Synthetic Data ---
             # Randomly sample labels from the pool of all available labels
@@ -268,14 +342,13 @@ class OursV2(Server):
 
             # KL Divergence Loss
             # We assume the "Teacher" is the Softmax of the averaged logits
-            loss_kd = criterion_kd(
-                F.log_softmax(student_logits / self.T, dim=1),
-                F.softmax(teacher_avg_logits / self.T, dim=1)
-            ) * (self.T * self.T)
+            loss_kd = KD_loss(student_logits, teacher_avg_logits, self.T)
 
             loss_kd.backward()
-            optimizer_c.step()
-
+            self.optimizer_c.step()
+            self.scheduler_c.step()
+            if step % 10 == 0:
+                print(f"[Server-side] Generator update: Step {step}: Loss={loss_kd.item():.4f} | Lr: {self.optimizer_c.param_groups[0]['lr']}")
     def send_models(self):
         for client in self.clients:
             client.set_parameters(self.global_model)
@@ -290,3 +363,12 @@ class OursV2(Server):
                 "model": client.model,
                 "label": client.unique_labels
             }
+            self.uploaded_models.append(client.model)
+
+    # def aggregate_parameters(self):
+    #     uploaded_models = []
+    #     for client_id in self.client_info_dict:
+    #         model = self.client_info_dict[client_id]["model"]
+    #         uploaded_models.append(model)
+
+        

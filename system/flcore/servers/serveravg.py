@@ -49,7 +49,7 @@ class FedAvg(Server):
 
                 # c. Client Local Training
                 for client in self.selected_clients:
-                    client.train(task=self.client_task_sequences[client.id][task])
+                    client.train(task=task)
 
                 # d. Log Local Accuracy (Sau khi train)
                 if i % self.eval_gap == 0:
