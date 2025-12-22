@@ -78,13 +78,6 @@ class Server(object):
 
         self.file_name = f"{self.args.algorithm}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 
-        self.client_task_sequences = []
-        for i in range(self.num_clients):
-            # Tạo danh sách Task ID từ 0 đến N_TASKS-1
-            sequence = list(range(self.N_TASKS))
-            # Hoán vị ngẫu nhiên để tạo tính Temporal Heterogeneity
-            random.shuffle(sequence) 
-            self.client_task_sequences.append(sequence)
 
         # Theo dõi bước hiện tại trong lộ trình (curriculum step)
         self.current_curriculum_step = 0
@@ -102,74 +95,26 @@ class Server(object):
         self.global_accuracy_matrix = []
 
     def set_clients(self, clientObj):
-        self.global_task_label_mapping = {}
-        
-        # 1. Tạo Pool dữ liệu cho từng Task (Load 1 lần duy nhất mỗi Task)
-        task_data_pools = {}
-        print("--- Pre-loading and Shuffling Task Pools ---")
-        for tid in range(self.N_TASKS):
-            # Load toàn bộ 10.000 ảnh của Task ID này
-            # (Dùng client_id=0 hoặc -1 tùy read_func để lấy full task data)
+        for i in range(self.num_clients):
+            print(f"Creating client {i} ...")
             if self.args.dataset == 'IMAGENET1k':
-                read_func = read_client_data_FCL_imagenet1k
+                train_data, label_info = read_client_data_FCL_imagenet1k(i, task=0, classes_per_task=self.args.cpt, count_labels=True)
             elif self.args.dataset == 'CIFAR100':
-                read_func = read_client_data_FCL_cifar100
+                train_data, label_info = read_client_data_FCL_cifar100(i, task=0, classes_per_task=self.args.cpt, count_labels=True)
             elif self.args.dataset == 'CIFAR10':
-                read_func = read_client_data_FCL_cifar10
+                train_data, label_info = read_client_data_FCL_cifar10(i, task=0, classes_per_task=self.args.cpt, count_labels=True)
             else:
                 raise NotImplementedError("Not supported dataset")
-            full_task_data, label_info = read_func(0, task=tid, classes_per_task=self.args.cpt, count_labels=True)
-            
-            # Lưu trữ data và danh sách index đã xáo trộn
-            indices = list(range(len(full_task_data)))
-            random.shuffle(indices)
-            
-            task_data_pools[tid] = {
-                'dataset': full_task_data,
-                'indices': indices,
-                'labels': label_info['labels']
-            }
-            self.global_task_label_mapping[tid] = label_info['labels']
 
-        # 2. Phân phối dữ liệu cho từng Client
-        for i in range(self.num_clients):
-            # Xác định Client i đang ở bước đầu tiên của trình tự nào
-            initial_task_id = self.client_task_sequences[i][0]
-            pool = task_data_pools[initial_task_id]
-            
-            # 3. Tính toán số mẫu cho client này (Ví dụ: chia đều + nhiễu ngẫu nhiên)
-            # Giả sử 10.000 ảnh chia cho 10 client học task đó -> ~1000 ảnh/client
-            avg_samples = len(pool['dataset']) // (self.num_clients // self.N_TASKS + 1)
-            num_samples = random.randint(int(avg_samples * 0.5), int(avg_samples * 1.5))
-            
-            # Đảm bảo không lấy quá số lượng còn lại trong pool
-            num_samples = min(num_samples, len(pool['indices']))
-            
-            # Bốc thăm các chỉ số index (Không hoàn lại - No replacement)
-            chosen_indices = pool['indices'][:num_samples]
-            pool['indices'] = pool['indices'][num_samples:] # Loại bỏ các index đã dùng
-            
-            # Tạo Subset dataset cho client
-            client_train_data = torch.utils.data.Subset(pool['dataset'], chosen_indices)
-
-            # 4. Khởi tạo Client
-            client = clientObj(self.args, id=i, train_data=client_train_data, task_sequence=self.client_task_sequences[i])
-            client.current_task_id = initial_task_id
-            client.task_dict[initial_task_id] = pool['labels']
-            client.current_labels = list(pool['labels'])
-            client.classes_so_far = list(pool['labels'])
-            client.file_name = self.file_name
-            
+            client = clientObj(self.args, id=i, train_data=train_data)
             self.clients.append(client)
-            print(f"Client {i:02d} | Task {initial_task_id} | Samples: {len(client_train_data)} | Labels: {pool['labels']}")
 
+            # update classes so far & current labels
+            client.classes_so_far.extend(label_info['labels'])
+            client.current_labels.extend(label_info['labels'])
+            client.task_dict[0] = label_info['labels']
+            client.file_name = self.file_name
         self.print_task_curriculum()
-        # Thêm vào cuối hàm set_clients trong Server
-        for client in self.clients:
-            t0_id = client.task_sequence[0]
-            # Acc(theta_i^0; T_i^0) - Lưu hiệu suất ban đầu
-            acc, _ = client.test_metrics(task=t0_id)
-            client.acc_l_t0_init = acc if acc > 0 else 0.01
 
     def select_clients(self):
         if self.random_join_ratio:
@@ -254,63 +199,41 @@ class Server(object):
         for server_param, client_param in zip(self.global_model.parameters(), client_model.parameters()):
             server_param.data += client_param.data.clone() * w
 
-    def test_metrics(self, task, glob_iter=None, flag="off"):
-        """
-        Đo lường hiệu suất của mô hình trên tập test.
-        task: ID của task cần kiểm tra.
-        glob_iter: Vòng lặp hiện tại (để log wandb).
-        flag: "global", "local" hoặc "off".
-        model_to_use: Mô hình cụ thể cần test (thường là self.global_model).
-        """
+    def test_metrics(self, task, glob_iter, flag):
+        
         num_samples = []
         tot_correct = []
-        
-
         for c in self.clients:
-            # Gọi hàm test_metrics của client với tham số model_to_use
-            # [Lưu ý: Client cần được cập nhật hàm test_metrics để nhận model_to_use]
             ct, ns = c.test_metrics(task=task)
-            tot_correct.append(ct * 1.0)
+            tot_correct.append(ct*1.0)
             num_samples.append(ns)
 
-        ids = [c.id for c in self.clients]
-        total_samples = sum(num_samples)
+            test_acc = sum(tot_correct)*1.0 / sum(num_samples)
+    
+            if flag != "off":
+                if flag == "global":
+                    subdir = os.path.join(self.save_folder, f"Client_Global/Client_{c.id}")
+                    log_key = f"Client_Global/Client_{c.id}/Averaged Test Accurancy"
+                elif flag == "local":
+                    subdir = os.path.join(self.save_folder, f"Client_Local/Client_{c.id}")
+                    log_key = f"Client_Local/Client_{c.id}/Averaged Test Accurancy"
 
-        # FIX: Kiểm tra tránh lỗi ZeroDivisionError
-        if total_samples == 0:
-            # Nếu không có dữ liệu test, trả về kết quả mặc định để không gây crash
-            # Trả về ns=1 để tránh lỗi chia cho 0 ở các hàm gọi bên ngoài như eval()
-            return ids, [1.0], [0.0]
-
-        test_acc = sum(tot_correct) * 1.0 / total_samples
-
-        # Logic ghi log (chỉ thực hiện khi flag không phải "off")
-        if flag != "off":
-            if flag == "global":
-                subdir = os.path.join(self.save_folder, "Client_Global")
-                log_prefix = "Client_Global"
-            elif flag == "local":
-                subdir = os.path.join(self.save_folder, "Client_Local")
-                log_prefix = "Client_Local"
-
-            # Log kết quả từng client nếu cần thiết
-            for i, client_id in enumerate(ids):
-                c_acc = tot_correct[i] / num_samples[i] if num_samples[i] > 0 else 0
-                log_key = f"{log_prefix}/Client_{client_id}/Test_Accuracy"
-                
                 if self.args.wandb:
-                    wandb.log({log_key: c_acc}, step=glob_iter)
-
+                    wandb.log({log_key: test_acc}, step=glob_iter)
+                
                 if self.offlog:
-                    client_dir = os.path.join(subdir, f"Client_{client_id}")
-                    os.makedirs(client_dir, exist_ok=True)
-                    file_path = os.path.join(client_dir, "test_accuracy.csv")
+                    os.makedirs(subdir, exist_ok=True)
+
+                    file_path = os.path.join(subdir, "test_accuracy.csv")
                     file_exists = os.path.isfile(file_path)
-                    with open(file_path, mode="a", newline="") as f:
+
+                    with open(file_path, mode="w", newline="") as f:
                         writer = csv.writer(f)
                         if not file_exists:
-                            writer.writerow(["Step", "Test Accuracy"])
-                        writer.writerow([glob_iter, c_acc])
+                            writer.writerow(["Step", "Test Accuracy"])  
+                        writer.writerow([glob_iter, test_acc]) 
+
+        ids = [c.id for c in self.clients]
 
         return ids, num_samples, tot_correct
 
@@ -338,7 +261,7 @@ class Server(object):
             log_keys = {
                 "Global/Averaged Train Loss": train_loss,
                 "Global/Averaged Test Accuracy": test_acc,
-                # "Global/Averaged Angle": self.angle_value,
+                "Global/Averaged Angle": self.angle_value,
                 "Global/Averaged Grads Angle": self.grads_angle_value,
                 "Global/Averaged Distance": self.distance_value,
                 "Global/Averaged GradNorm": self.norm_value,
@@ -455,7 +378,7 @@ class Server(object):
         mse = F.mse_loss(params1, params2)
         return mse.item()
 
-    def spatio_grad_eval(self, model_origin, glob_iter):
+    def spatio_grad_eval(self, model_origin):
         angle = [self.cos_sim(model_origin, self.global_model, models) for models in self.uploaded_models]
         distance = [self.distance(self.global_model, models) for models in self.uploaded_models]
         norm = [self.distance(model_origin, models) for models in self.uploaded_models]
@@ -463,38 +386,11 @@ class Server(object):
         self.distance_value = statistics.mean(distance)
         self.norm_value = statistics.mean(norm)
         angle_value = []
-
-        # for grad_i in self.grads:
-        #     for grad_j in self.grads:
-        #         angle_value.append(self.cosine_similarity(grad_i, grad_j))
-
-        for i in range(len(self.grads)):
-            for j in range(i + 1, len(self.grads)):
-                angle_value.append(self.cosine_similarity(self.grads[i], self.grads[j]))
-
-        cosine_to_client0 = {}
-        count_positive = 0  # cosine > 0
-        count_negative = 0  # cosine >= 0
-
-        for i in range(1, len(self.grads)):
-            sim = self.cosine_similarity(self.grads[0], self.grads[i])
-            cosine_to_client0[f"{i}"] = sim
-
-            if sim > 0:
-                count_positive += 1
-            if sim <= 0:
-                count_negative += 1
-
-        if self.args.wandb:
-            wandb.log({f"cosine/{k}": v for k, v in cosine_to_client0.items()}, step=glob_iter)
-
-            wandb.log({
-                "cosine_count/positive (>0)": count_positive,
-                "cosine_count/negative (<=0)": count_negative
-            }, step=glob_iter)
-
+        for grad_i in self.grads:
+            for grad_j in self.grads:
+                angle_value.append(self.cosine_similarity(grad_i, grad_j))
         self.grads_angle_value = statistics.mean(angle_value)
-        # print(f"grad angle: {self.grads_angle_value}")
+        print(f"grad angle: {self.grads_angle_value}")
 
     def proto_eval(self, global_model, local_model, task, round):
         # TODO save models to ./pca_eval/file_name/global
@@ -517,60 +413,93 @@ class Server(object):
 
     def print_task_curriculum(self):
         print("\n" + "="*60)
-        print("CLIENT TASK CURRICULUM (Temporal Heterogeneity)")
+        print(f"TASK CURRICULUM REPORT (Total Clients: {len(self.clients)})")
         print("="*60)
-        
-        # In trình tự của 5 client đầu tiên (để tránh spam nếu có 100 client)
-        for i in range(self.num_clients):
-            seq = self.client_task_sequences[i]
-            seq_str = " -> ".join([f"Task {tid}" for tid in seq])
-            print(f"Client {i:02d}: {seq_str}")
-        
-        print("\n" + "="*60)
-        print("TASK ID TO LABEL MAPPING (Spatial Heterogeneity Check)")
-        print("="*60)
-        
-        # Sắp xếp theo Task ID (0, 1, 2, 3, 4)
-        for tid in sorted(self.global_task_label_mapping.keys()):
-            labels = self.global_task_label_mapping[tid]
-            num_labels = len(labels)
-            
-                
-            print(f"Task ID {tid}: Total {num_labels:2d} classes | Preview: {labels}")
-            
-            # Kiểm tra nhanh: Nếu không phải 20 classes thì cảnh báo ngay
-            if num_labels != self.args.cpt:
-                print(f"   [!] WARNING: Task {tid} has {num_labels} classes, expected {self.args.cpt}!")
-
-        print("="*60 + "\n")
-
-    def compute_knowledge_retention(self, glob_iter):
-        total_kr_s, total_kr_t = 0, 0
-        count_s, count_t = 0, 0
 
         for client in self.clients:
-            # KR_s: Acc(Global) / Acc(Local) on current task
-            acc_g, _ = client.test_metrics(task=client.current_task_id, model_to_use=self.global_model)
-            acc_l, _ = client.test_metrics(task=client.current_task_id) # Uses client.model
+            print(f"Client ID: {client.id}")
             
-            if acc_l > 0:
-                total_kr_s += (acc_g / acc_l)
-                count_s += 1
+            # Check if the dictionary is empty
+            if not client.task_dict:
+                print("   [No tasks assigned yet]")
+                continue
 
-            # KR_t: Acc(Local_now; T0) / Acc(Local_init; T0)
-            t0_id = client.task_sequence[0]
-            acc_l_now, _ = client.test_metrics(task=t0_id)
+            # Sort task IDs to print in order (Task 0, Task 1...)
+            sorted_task_ids = sorted(client.task_dict.keys())
             
-            # Initial Task 0 performance captured during Server.set_clients
-            if hasattr(client, 'acc_l_t0_init') and client.acc_l_t0_init > 0:
-                total_kr_t += (acc_l_now / client.acc_l_t0_init)
-                count_t += 1
+            for t_id in sorted_task_ids:
+                labels = client.task_dict[t_id]
+                
+                # Handle different data types (Tensor, Numpy, List)
+                if hasattr(labels, 'tolist'):
+                    labels = labels.tolist()
+                elif isinstance(labels, list):
+                    pass # It's already a list
+                else:
+                    # If it's a single number or unexpected type
+                    labels = list(labels)
 
-        if self.args.wandb:
-            wandb.log({
-                "Metrics/KR_s": (total_kr_s / count_s) * 100 if count_s > 0 else 0,
-                "Metrics/KR_t": (total_kr_t / count_t) * 100 if count_t > 0 else 0
-            }, step=glob_iter)
+                # Sort labels for easier visual comparison
+                labels = sorted(labels)
+                
+                print(f"   Task {t_id:<2} | Count: {len(labels):<2} | Labels: {labels}")
+            
+            print("-" * 30)
+        print("="*60 + "\n")
+
+    def compute_knowledge_retention(self, current_task, round=None):
+        """
+        Computes accuracy on all tasks seen so far (0 to current_task) 
+        and logs the results to WandB.
+        """
+        task_accuracies = []
+        wandb_logs = {}
+
+        print(f"\n--- Computing Knowledge Retention (Tasks 0 to {current_task}) ---")
+
+        # 1. Iterate through all previous tasks up to the current one
+        for task_id in range(current_task + 1):
+            total_correct = 0
+            total_samples = 0
+
+            # 2. Collect metrics from all clients
+            for client in self.clients:
+                # OPTIONAL: Sync global model if evaluating global performance
+                # client.set_parameters(self.global_model) 
+
+                correct, num_samples = client.test_metrics(task=task_id)
+                total_correct += correct
+                total_samples += num_samples
+
+            # 3. Calculate accuracy
+            if total_samples > 0:
+                task_acc = total_correct / total_samples
+            else:
+                task_acc = 0.0
+            
+            task_accuracies.append(task_acc)
+            
+            # Prepare individual task log
+            wandb_logs[f"Retention/Task_{task_id}_Acc"] = task_acc
+            print(f"   Task {task_id} Accuracy: {task_acc:.4f}")
+
+        # 4. Calculate Average Retention
+        avg_retention = sum(task_accuracies) / len(task_accuracies) if task_accuracies else 0.0
+        wandb_logs[f"Retention/Average_Acc"] = avg_retention
+        
+        # 5. Add 'round' or 'task' to x-axis context if provided
+        if round is not None:
+            wandb_logs['Round'] = round
+        wandb_logs['Current_Task'] = current_task
+
+        # 6. Upload to WandB
+        if wandb.run is not None:
+            wandb.log(wandb_logs)
+        
+        print(f"   [Summary] Average Retention: {avg_retention:.4f}")
+        print("------------------------------------------------------------\n")
+
+        return avg_retention, task_accuracies
 
     def calculate_table1_accuracy(self, current_step, glob_iter):
         task_accs = {}
@@ -622,10 +551,3 @@ class Server(object):
         
         # Chỉ số 4: Trực quan hóa t-SNE
         self.visualize_tsne(step, glob_iter)
-        
-        # Chuyển Task cho Client (Temporal Heterogeneity)
-        if step < self.N_TASKS - 1:
-            for client in self.clients:
-                client.move_to_next_task()
-                if client.current_task_id not in self.global_task_label_mapping:
-                    self.global_task_label_mapping[client.current_task_id] = client.current_labels

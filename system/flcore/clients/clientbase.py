@@ -3,12 +3,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 import statistics
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 from utils.data_utils import *
 
 from flcore.trainmodel.models import *
 
 import os
+import joblib
 
 
 class Client(object):
@@ -16,7 +17,7 @@ class Client(object):
     Base class for clients in federated learning.
     """
 
-    def __init__(self, args, id, train_data, task_sequence, **kwargs):
+    def __init__(self, args, id, train_data, **kwargs):
         torch.manual_seed(0)
         self.t_angle_after = 0
 
@@ -72,10 +73,6 @@ class Client(object):
         self.last_copy = None
         self.if_last_copy = False
         self.args = args
-        self.task_sequence = task_sequence
-        self.curriculum_step = 0
-        self.current_task_id = task_sequence[0]
-        self.tasks_seen_so_far = []
         self.unique_labels = set()
 
     def next_task(self, train, label_info = None, if_label = True):
@@ -111,6 +108,73 @@ class Client(object):
             
         return
 
+    def _initialize_first_task(self):
+        """Initialize labels information for the first task"""
+        available_labels = set()
+        available_labels_current = set()
+        available_labels_past = set()
+
+        for client in self.clients:
+            available_labels.update(client.classes_so_far)
+            available_labels_current.update(client.current_labels)
+
+        for client in self.clients:
+            client.available_labels = sorted(list(available_labels))
+            client.available_labels_current = sorted(list(available_labels_current))
+            client.available_labels_past = sorted(list(available_labels_past))
+            # Initialize PIM for each client
+            client.initialize_pim(self.global_model)
+
+        print(f"Task 0 - Total labels: {len(available_labels)}, "
+              f"Current: {len(available_labels_current)}, Past: {len(available_labels_past)}")
+
+    def _prepare_new_task(self, task):
+        """Prepare clients for a new task by loading new data"""
+        self.current_task = task
+        torch.cuda.empty_cache()
+
+        for i in range(len(self.clients)):
+            # Load new task data based on dataset
+            if self.args.dataset == 'IMAGENET1k':
+                train_data, label_info = read_client_data_FCL_imagenet1k(
+                    i, task=task, classes_per_task=self.args.cpt, count_labels=True)
+            elif self.args.dataset == 'CIFAR100':
+                train_data, label_info = read_client_data_FCL_cifar100(
+                    i, task=task, classes_per_task=self.args.cpt, count_labels=True)
+            elif self.args.dataset == 'CIFAR10':
+                train_data, label_info = read_client_data_FCL_cifar10(
+                    i, task=task, classes_per_task=self.args.cpt, count_labels=True)
+            else:
+                raise NotImplementedError(f"Dataset {self.args.dataset} not supported")
+
+            # Update client dataset
+            self.clients[i].next_task(train_data, label_info)
+
+        # Update labels information across all clients
+        self._update_labels_info(task)
+
+    def _update_labels_info(self, task):
+        """Update available labels across all clients"""
+        available_labels = set()
+        available_labels_current = set()
+
+        # Get past labels from first client (before update)
+        available_labels_past = set(self.clients[0].available_labels) if task > 0 else set()
+
+        # Collect all labels
+        for client in self.clients:
+            available_labels.update(client.classes_so_far)
+            available_labels_current.update(client.current_labels)
+
+        # Update all clients with new label information
+        for client in self.clients:
+            client.available_labels = sorted(list(available_labels))
+            client.available_labels_current = sorted(list(available_labels_current))
+            client.available_labels_past = sorted(list(available_labels_past))
+
+        print(f"Task {task} - Total labels: {len(available_labels)}, "
+              f"Current: {len(available_labels_current)}, Past: {len(available_labels_past)}")
+
     def assign_task_id(self, task_dict):
         if not isinstance(task_dict, dict):
             raise ValueError("task_dict must be a dictionary")
@@ -123,7 +187,7 @@ class Client(object):
     def load_train_data(self, task, batch_size=None):
         if batch_size == None:
             batch_size = self.batch_size
-        
+
         if self.args.dataset == 'IMAGENET1k':
             train_data = read_client_data_FCL_imagenet1k(self.id, task=task, classes_per_task=self.args.cpt, count_labels=False, train=True)
         elif self.args.dataset == 'CIFAR100':
@@ -144,7 +208,7 @@ class Client(object):
         elif self.args.dataset == 'CIFAR10':
             test_data = read_client_data_FCL_cifar10(self.id, task=task, classes_per_task=self.args.cpt, count_labels=False, train=False)
 
-        return test_data  
+        return DataLoader(test_data, batch_size, drop_last=False, shuffle=True)  
 
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.model.parameters()):
@@ -159,22 +223,27 @@ class Client(object):
         for param, new_param in zip(model.parameters(), new_params):
             param.data = new_param.data.clone()
 
-    def test_metrics(self, task, model_to_use=None):
-        # Nếu không truyền model, mặc định dùng model của client
-        model = model_to_use if model_to_use is not None else self.model
-        model.eval()
+    def test_metrics(self, task):
+        testloader = self.load_test_data(task=task)
+
+        self.model.eval()
+
+        test_acc = 0
+        test_num = 0
         
-        test_data = self.load_test_data(task=task)
-        loader = DataLoader(test_data, batch_size=self.batch_size, shuffle=False)
-        
-        correct, total = 0, 0
         with torch.no_grad():
-            for x, y in loader:
-                x, y = x.to(self.device), y.to(self.device)
-                out = model(x)
-                correct += (torch.argmax(out, dim=1) == y).sum().item()
-                total += y.size(0)
-        return correct, total
+            for x, y in testloader:
+                if type(x) == type([]):
+                    x[0] = x[0].to(self.device)
+                else:
+                    x = x.to(self.device)
+                y = y.to(self.device)
+                output = self.model(x)
+
+                test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
+                test_num += y.shape[0]
+        
+        return test_acc, test_num
 
     def train_metrics(self, task):
         trainloader = self.load_train_data(task=task)
@@ -289,19 +358,10 @@ class Client(object):
 
         # TODO Measure Gradient Angles After Aggregate
         angle_value = []
-
-        # for model_i in network_test:
-        #     for model_j in network_test:
-        #         angle_value.append(self.cos_sim(old_model, model_i, model_j))
-
-        for i in range(len(network_test)):
-            for j in range(i + 1, len(network_test)):
-                angle_value.append(self.cos_sim(old_model, network_test[i], network_test[j]))
-
-        if angle_value:
-            self.t_angle_after = statistics.mean(angle_value)
-        else:
-            self.t_angle_after = 1
+        for model_i in network_test:
+            for model_j in network_test:
+                angle_value.append(self.cos_sim(old_model, model_i, model_j))
+        self.t_angle_after = statistics.mean(angle_value)
         print(f"AFTER  t angle:{self.t_angle_after}")
 
     def cos_sim(self, prev_model, model1, model2):
@@ -328,67 +388,61 @@ class Client(object):
         mse = F.mse_loss(params1, params2)
         return mse.item()
 
-    def move_to_next_task(self):
-        # 1. Lưu task hiện tại vào lịch sử trước khi nhảy sang task mới
-        if self.current_task_id not in self.tasks_seen_so_far:
-            self.tasks_seen_so_far.append(self.current_task_id)
-
-        # 2. Chuyển sang bước tiếp theo trong lộ trình (Temporal Heterogeneity)
-        self.curriculum_step += 1
-        
-        if self.curriculum_step < len(self.task_sequence):
-            # Lấy Task ID tiếp theo từ trình tự riêng của client này
-            next_id = self.task_sequence[self.curriculum_step]
-            self.current_task_id = next_id
-
-            # 3. Tận dụng logic nạp dữ liệu (giống trong load_train_data của bạn)
-            # Ở đây ta cần lấy 'train_data' gốc và 'label_info'
-            if self.args.dataset == 'IMAGENET1k':
-                train_data, label_info = read_client_data_FCL_imagenet1k(self.id, task=next_id, classes_per_task=self.args.cpt, count_labels=True, train=True)
-            elif self.args.dataset == 'CIFAR100':
-                train_data, label_info = read_client_data_FCL_cifar100(self.id, task=next_id, classes_per_task=self.args.cpt, count_labels=True, train=True)
-            elif self.args.dataset == 'CIFAR10':
-                train_data, label_info = read_client_data_FCL_cifar10(self.id, task=next_id, classes_per_task=self.args.cpt, count_labels=True, train=True)
-
-            # 4. Gọi hàm next_task có sẵn của bạn để đồng bộ mô hình và nhãn
-            # Hàm này của bạn sẽ cập nhật self.train_data, self.model_copy, v.v.
-            self.next_task(train=train_data, label_info=label_info, if_label=True)
+    def get_feature_embeddings(self, model=None, task_id=None, num_samples=None):
+        """
+        Extracts feature embeddings as TENSORS (CPU).
+        """
+        if task_id is None:
+            task_id = self.current_task
             
-            # Cập nhật thêm task_dict theo ID thực tế để quản lý
-            self.task_dict[next_id] = label_info['labels']
-            
-            return True
-        return False
+        target_model = model if model is not None else self.model
 
-# Bổ sung vào class Client
-    def get_feature_embeddings(self, model_to_use=None):
-        """Trích xuất feature (output của layer trước FC) để vẽ t-SNE."""
-        model = model_to_use if model_to_use is not None else self.model
-        model.eval()
+        # Load Test Data
+        dataloader = self.load_test_data(task=task_id, batch_size=self.batch_size)
         
-        # Lấy tất cả task đã học + task hiện tại
-        history = self.tasks_seen_so_far + [self.current_task_id]
-        test_datasets = [self.load_test_data(tid) for tid in history]
-        loader = DataLoader(ConcatDataset(test_datasets), batch_size=self.batch_size, shuffle=False)
+        target_model.eval()
+        target_model.to(self.device)
         
-        feats, labels = [], []
+        features_list = []
+        labels_list = []
+        count = 0
+
         with torch.no_grad():
-            for x, y in loader:
-                x = x.to(self.device)
-                # Giả sử mô hình có phần 'base' trích xuất feature
-                # Nếu dùng ResNet/CNN chuẩn, thường là model.base(x)
-                f = model.base(x).view(x.size(0), -1) 
-                feats.append(f.cpu())
-                labels.append(y)
-        return torch.cat(feats), torch.cat(labels)
+            for x, y in dataloader:
+                if isinstance(x, list):
+                    x[0] = x[0].to(self.device)
+                else:
+                    x = x.to(self.device)
+                
+                # Extract Features
+                if hasattr(target_model, 'base'):
+                    feats = target_model.base(x)
+                else:
+                    feats = x
+                    modules = list(target_model.children())[:-1]
+                    feature_extractor = nn.Sequential(*modules)
+                    feats = feature_extractor(x)
+                    feats = feats.view(feats.size(0), -1)
 
-    
-    # def proto_eval(self, model, task, round):
-    #     save_dir = os.path.join("pca_eval", self.file_name, "local")
-    #     if not os.path.exists(save_dir):
-    #         os.makedirs(save_dir)
-    #
-    #     # Save model state_dict
-    #     model_filename = f"task_{task}_round_{round}.pth"
-    #     model_path = os.path.join(save_dir, model_filename)
-    #     torch.save(model.state_dict(), model_path)
+                # --- SỬA ĐỔI QUAN TRỌNG ---
+                # Giữ nguyên là Tensor, chỉ đưa về CPU để tiết kiệm VRAM
+                features_list.append(feats.detach().cpu()) 
+                labels_list.append(y.detach().cpu())
+                # --------------------------
+                
+                count += len(y)
+                if num_samples is not None and count >= num_samples:
+                    break
+
+        # Gom lại bằng torch.cat thay vì np.concatenate
+        if len(features_list) > 0:
+            features = torch.cat(features_list, dim=0)
+            labels = torch.cat(labels_list, dim=0)
+            
+            if num_samples is not None:
+                features = features[:num_samples]
+                labels = labels[:num_samples]
+                
+            return features, labels
+        else:
+            return torch.tensor([]), torch.tensor([])
