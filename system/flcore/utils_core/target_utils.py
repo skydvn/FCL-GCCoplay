@@ -545,3 +545,19 @@ def refine_as_not_true(logits, targets, num_classes):
     logits = torch.gather(logits, 1, nt_positions)
 
     return logits
+
+
+from collections import Counter
+
+def get_class_counts(dataloader):
+    # Khởi tạo bộ đếm
+    counts = Counter()
+    
+    # Duyệt qua từng batch trong dataloader
+    for x, y in dataloader:
+        # 'y' là một Tensor chứa nhãn của batch (ví dụ: tensor([1, 0, 1, 2]))
+        # .tolist() chuyển nó về dạng list Python (ví dụ: [1, 0, 1, 2]) để Counter đếm được
+        counts.update(y.tolist())
+        
+    # Trả về kết quả (sắp xếp theo key để dễ nhìn)
+    return dict(sorted(counts.items()))
