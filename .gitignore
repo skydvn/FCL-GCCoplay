@@ -18,4 +18,3 @@ Proto
 draw
 ***.out
 .ipynb_checkpoints
-dataset/class_order/class_order_cifar100_100clients.npy
