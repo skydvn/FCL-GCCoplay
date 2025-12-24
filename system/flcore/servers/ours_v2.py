@@ -144,6 +144,7 @@ class OursV2(Server):
                     u.available_labels_current = list(available_labels_current)
                     u.available_labels_past = list(available_labels_past)
 
+
             # --- Training Rounds ---
             for i in range(self.global_rounds):
                 print(f"\n-------------Round number: {i}-------------")
@@ -157,6 +158,7 @@ class OursV2(Server):
                     client.train(task=task)
                 
                 self.receive_models()
+                # FIXME Remove self.train_global_generator()
                 self.train_global_generator() 
                 self.aggregate_parameters()
                 
@@ -165,6 +167,13 @@ class OursV2(Server):
 
             # --- Post-Task Processing ---
             self.receive_models()
+
+            # TODO Evaluate test accuracy of local models before generator training.
+            # TODO Local model u of task t -> test on task t and t-1...
+            # TODO Print and test images from global generators to see how good are the images according to each class.
+            # TODO Use images from generators, apply on all local models --> report the test accuracy syn
+            # TODO Apply the real dataset, and see the test accuracy real.
+            # TODO Measure the generalization gap = test acc real - test acc syn
             self.train_global_generator()
             self.train_global_classifier()
             

@@ -129,6 +129,7 @@ class clientOursV2(Client):
                     # Student Predictions
                     student_logits = self.model(syn_inputs.detach())
 
+                    # TODO Design a replay-based loss
                     # KL Divergence
                     log_pred_student = F.log_softmax(student_logits / self.T, dim=1)
                     pred_teacher = F.softmax(teacher_logits / self.T, dim=1)
