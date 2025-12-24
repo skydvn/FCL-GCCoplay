@@ -15,7 +15,9 @@ class clientOursV2(Client):
         
         # --- Config Generator ---
         if 'cifar100' in args.dataset.lower():
-            self.img_size = 32; self.nz = 512
+            self.img_size = 32; self.nz = 256
+            self.mean = (0.5071, 0.4867, 0.4408)
+            self.std = (0.2675, 0.2565, 0.2761)
         elif 'imagenet' in args.dataset.lower():
             self.img_size = 64 if '100' in args.dataset else 224; self.nz = 256
         else:
@@ -123,12 +125,15 @@ class clientOursV2(Client):
                     
                     with torch.no_grad():
                         syn_inputs = self.generator(z, fake_labels)
+                        syn_inputs = (syn_inputs + 1) / 2.0
+                        syn_inputs = self.batch_normalize(syn_inputs, mean=self.mean, std=self.std)
                         # Teacher Soft Targets
                         teacher_logits = self.old_network(syn_inputs)
 
                     # Student Predictions
                     student_logits = self.model(syn_inputs.detach())
 
+                    # TODO Design a replay-based loss
                     # KL Divergence
                     log_pred_student = F.log_softmax(student_logits / self.T, dim=1)
                     pred_teacher = F.softmax(teacher_logits / self.T, dim=1)
@@ -152,3 +157,12 @@ class clientOursV2(Client):
         
         self.train_time_cost['num_rounds'] += 1
         self.train_time_cost['total_cost'] += time.time() - start_time
+
+    def batch_normalize(self, batch_tensor, mean, std):
+        """
+        Normalizes a batch of tensors (N, C, H, W) using dataset mean/std.
+        """
+        # Create tensors for mean and std and reshape for broadcasting
+        mean_t = torch.tensor(mean, device=batch_tensor.device).view(1, -1, 1, 1)
+        std_t = torch.tensor(std, device=batch_tensor.device).view(1, -1, 1, 1)
+        return (batch_tensor - mean_t) / std_t

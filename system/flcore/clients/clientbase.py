@@ -87,7 +87,7 @@ class Client(object):
             )
 
         self.last_copy  = copy.deepcopy(self.model)
-        self.last_copy.cuda()
+        self.last_copy.to(self.device)
         self.if_last_copy = True
         
         # update dataset: 

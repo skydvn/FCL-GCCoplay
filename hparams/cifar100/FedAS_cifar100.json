@@ -2,7 +2,7 @@
     "log": false,
     "offlog": false,
     "wandb": false,
-    "optimizer": "sgd",
+    "optimizer": "adam",
     "datadir": "dataset",
     "device": "cuda",
     "device_id": "0",
@@ -10,7 +10,7 @@
     "num_classes": 100,
     "model": "CNN",
     "batch_size": 64,
-    "local_learning_rate": 0.005,
+    "local_learning_rate": 0.01,
     "learning_rate_decay": false,
     "learning_rate_decay_gamma": 0.99,
     "global_rounds": 50,
@@ -24,7 +24,7 @@
     "eval_gap": 1,
     "out_folder": "out",
     "note": null,
-    "num_tasks": 250,
+    "num_tasks":5,
 
     "client_drop_rate": 0.0,
     "time_threthold": 10000

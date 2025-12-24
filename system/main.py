@@ -103,13 +103,13 @@ def run(args):
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedAvg(args, i)
 
-        if args.algorithm == "FedSSI":
+        elif args.algorithm == "FedSSI":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
             server = FedSSI(args, i)
 
-        if args.algorithm == "ReFedPlus":
+        elif args.algorithm == "ReFedPlus":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = BaseHeadSplit(args.model, args.head)
@@ -169,6 +169,7 @@ def run(args):
             args.model = BaseHeadSplit(args.model, args.head)
             server = OursV2(args, i)
         else:
+            print(args.algorithm)
             raise NotImplementedError
 
         server.train()
@@ -184,7 +185,7 @@ if __name__ == "__main__":
     total_start = time.time()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfp', type=str, default="./hparams/FedAvg.json", help='Configuration path for training')
+    parser.add_argument('--cfp', type=str, default=None, help='Configuration path for training')
     parser.add_argument('--note', type=str, default=None, help='Optional note to add to save name')
     parser.add_argument('--wandb', type=bool, default=False, help='Log on wandb')
     parser.add_argument('--offlog', type=bool, default=False, help='Save wandb logger')
@@ -233,6 +234,6 @@ if __name__ == "__main__":
     if args.device == "cuda" and not torch.cuda.is_available():
         print("\ncuda is not avaiable.\n")
         args.device = "cpu"
-
+    print(args)
     run(args)
 

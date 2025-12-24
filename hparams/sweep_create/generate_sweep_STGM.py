@@ -6,7 +6,7 @@ from itertools import product
 
 # Base config
 base_config = {
-    "optimizer": "sgd",
+    "optimizer": "adam",
     "datadir": "dataset",
     "device": "cuda",
     "device_id": "0",

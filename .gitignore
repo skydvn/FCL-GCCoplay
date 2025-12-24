@@ -15,6 +15,7 @@ out
 pca_eval
 Proto
 
+**.out
 ***.csv
 ***.pdf
 ***.npy

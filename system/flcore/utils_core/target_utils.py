@@ -256,60 +256,80 @@ class ImagePool(object):
         return UnlabeledImageDataset(self.root, transform=transform, nums=nums)
 
 
-# ==========================================
-# OPTIMIZED GENERATOR CLASS (Best for CIFAR-100/ImageR)
-# ==========================================
 class Generator(nn.Module):
     def __init__(self, nz=100, ngf=64, img_size=32, nc=3, num_classes=100, device=None):
         super(Generator, self).__init__()
         self.device = device
         self.params = (nz, ngf, img_size, nc, num_classes)
-        self.init_size = img_size // 4
+        self.nz = nz
+        self.ngf = ngf
+        self.nc = nc
+        self.init_size = img_size // 4  # 32 // 4 = 8
         
-        # Embedding mạnh hơn cho Class Condition
-        self.label_emb = nn.Sequential(
-            nn.Embedding(num_classes, nz),
-            nn.Linear(nz, nz)
-        )
-
-        # Linear Projection: Tăng độ sâu channel lên gấp 4 lần để giữ thông tin tốt hơn
+        # --- 1. Label Embedding ---
+        # Embed the label into a vector of size 'nz' to combine with noise
+        self.label_emb = nn.Embedding(num_classes, nz)
+        
+        # --- 2. Linear Layer ---
+        # Input size is nz * 2 (noise + label embedding)
+        # Output size creates feature maps of shape (ngf*2, init_size, init_size)
         self.l1 = nn.Sequential(
-            nn.Linear(nz * 2, ngf * 4 * self.init_size ** 2),
-            nn.BatchNorm1d(ngf * 4 * self.init_size ** 2),
-            nn.ReLU(True)
+            nn.Linear(nz * 2, ngf * 2 * self.init_size ** 2)
         )
 
+        # --- 3. Convolutional Blocks ---
         self.conv_blocks = nn.Sequential(
-            # Block 1: Upsample -> Conv -> BN -> ReLU
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(ngf * 4, ngf * 2, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.Upsample(scale_factor=2),  # 8x8 -> 16x16
+
+            nn.Conv2d(ngf * 2, ngf * 2, 3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(ngf * 2),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Upsample(scale_factor=2),  # 16x16 -> 32x32
 
-            # Block 2: Upsample -> Conv -> BN -> ReLU
-            nn.Upsample(scale_factor=2),
             nn.Conv2d(ngf * 2, ngf, 3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(ngf),
             nn.LeakyReLU(0.2, inplace=True),
-
-            # Output Layer: Tanh activation (-1, 1) tốt hơn Sigmoid cho GAN
+            
             nn.Conv2d(ngf, nc, 3, stride=1, padding=1),
-            nn.Tanh()  
+            nn.Tanh(),  # Use Tanh for [-1, 1] range or Sigmoid for [0, 1]
         )
 
     def forward(self, z, labels):
-        c = self.label_emb(labels)
-        gen_input = torch.cat((z, c), -1) # Nối noise và label
-        out = self.l1(gen_input)
-        out = out.view(out.shape[0], -1, self.init_size, self.init_size)
-        img = self.conv_blocks(out)
+        """
+        Args:
+            z: Noise vector of shape (batch_size, nz)
+            labels: Class labels of shape (batch_size,)
+        
+        Returns:
+            Generated images of shape (batch_size, nc, img_size, img_size)
+        """
+        # 1. Get the label embedding
+        label_emb = self.label_emb(labels)  # Shape: (batch_size, nz)
+        
+        # 2. Concatenate noise and label embedding
+        gen_input = torch.cat((z, label_emb), dim=-1)  # Shape: (batch_size, nz*2)
+        
+        # 3. Linear projection
+        out = self.l1(gen_input)  # Shape: (batch_size, ngf*2*init_size**2)
+        
+        # 4. Reshape to feature maps - EXPLICIT channel dimension
+        out = out.view(out.shape[0], self.ngf * 2, self.init_size, self.init_size)
+        # Shape: (batch_size, ngf*2, init_size, init_size)
+        
+        # 5. Generate image through conv blocks
+        img = self.conv_blocks(out)  # Shape: (batch_size, nc, img_size, img_size)
+        
         return img
 
     def clone(self):
-        # Clone full state để làm Anchor
-        clone = Generator(*self.params, device=self.device)
+        """
+        Create a deep copy of the generator on the same device.
+        """
+        current_device = next(self.parameters()).device
+        clone = Generator(*self.params, device=current_device)
         clone.load_state_dict(self.state_dict())
-        return clone.to(self.device)
+        return clone
 
 def kldiv( logits, targets, T=1.0, reduction='batchmean'):
     q = F.log_softmax(logits/T, dim=1)

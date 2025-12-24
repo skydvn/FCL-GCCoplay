@@ -1,5 +1,5 @@
 {
-    "optimizer": "sgd",
+    "optimizer": "adam",
     "datadir": "dataset",
     "device": "cuda",
     "device_id": "1",

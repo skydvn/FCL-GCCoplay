@@ -2,7 +2,7 @@
     "log": false,
     "offlog": false,
     "wandb": false,
-    "optimizer": "sgd",
+    "optimizer": "adam",
     "datadir": "dataset",
     "device": "cuda",
     "device_id": "0",
