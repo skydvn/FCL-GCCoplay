@@ -14,6 +14,7 @@ pretrain_model/task_sofar_model
 out
 pca_eval
 Proto
+output_debug
 
 **.out
 ***.csv
