@@ -25,7 +25,7 @@ from flcore.servers.serverrefedplus import ReFedPlus
 from flcore.servers.ours_v2 import OursV2
 from flcore.servers.ours import Ours
 from flcore.servers.servercoplay import serverCoplay
-from flcore.servers.serverdgr import
+from flcore.servers.serverdgr import serverDGR
 from flcore.trainmodel.models import *
 
 from flcore.trainmodel.AFFCL_models import AFFCLModel
