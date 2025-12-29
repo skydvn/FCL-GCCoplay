@@ -7,7 +7,7 @@ import copy
 from flcore.clients.clientbase import Client
 
 
-class clientCoplay(Client):
+class clientDGR(Client):
     """
     Deep Generative Replay Client
     Based on "Continual Learning with Deep Generative Replay" (NIPS 2017)

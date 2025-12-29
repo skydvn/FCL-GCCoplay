@@ -8,7 +8,7 @@ import os
 from torch import nn, optim
 from torchvision.utils import save_image
 from flcore.servers.serverbase import Server
-from flcore.clients.clientcoplay import clientCoplay
+from flcore.clients.clientdgr import clientDGR
 from flcore.utils_core.target_utils import *
 from utils.data_utils import read_client_data_FCL_cifar100, read_client_data_FCL_imagenet1k, read_client_data_FCL_cifar10, cifar100_train_transform
 
@@ -188,7 +188,7 @@ class serverCoplay(Server):
         self.scheduler_g = optim.lr_scheduler.MultiStepLR(self.optimizer_g, milestones=[30, 80], gamma=0.1)
         self.scheduler_c = optim.lr_scheduler.MultiStepLR(self.optimizer_c, milestones=[30, 80], gamma=0.1)
 
-        self.set_clients(clientCoplay)
+        self.set_clients(clientDGR)
         print(f"Server Initialized. Generator Config: ImgSize={self.img_size}, nz={self.nz}")
 
     def train(self):
