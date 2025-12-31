@@ -8,7 +8,7 @@ import numpy as np
 from torch.nn import functional as F
 import torchvision
 
-from flcore.trainmodel import FedCIL_generator.py
+from flcore.trainmodel import FedCIL_generator
 
 EPSILON = 1e-16
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -123,6 +123,20 @@ class WGAN(nn.Module):
                 channel_size=self.g_channel_size,
             )
             self.num_classes = 10
+
+        if dataset == 'CIFAR100':
+            self.critic = FedCIL_generator.Critic_CIFAR100(
+                image_size=self.image_size,
+                image_channel_size=self.image_channel_size,
+                channel_size=self.c_channel_size,
+            )
+            self.generator = FedCIL_generator.Generator_CIFAR(
+                z_size=self.z_size,
+                image_size=self.image_size,
+                image_channel_size=self.image_channel_size,
+                channel_size=self.g_channel_size,
+            )
+            self.num_classes = 100
 
         if dataset == 'EMNIST-L':
             self.critic = FedCIL_generator.Critic(

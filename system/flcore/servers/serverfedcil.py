@@ -10,6 +10,8 @@ Handles:
 """
 
 import time
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,7 +21,9 @@ import os
 from torchvision.utils import save_image
 from flcore.servers.serverbase import Server
 from flcore.clients.clientfedcil import clientFedCIL
-
+from flcore.trainmodel.FedCIL_models import WGAN
+from utils.data_utils import *
+from utils.model_utils import ParamDict
 
 class serverFedCIL(Server):
     """
@@ -40,9 +44,9 @@ class serverFedCIL(Server):
         # --- Dataset Configuration ---
         if 'cifar' in self.dataset.lower():
             self.img_size = 32
-            self.nz = 100 if 'cifar10' in self.dataset.lower() else 110
+            self.nz = 110 if 'cifar100' in self.dataset.lower() else 100
             self.nc = 3
-            self.num_classes = 10 if 'cifar10' in self.dataset.lower() else 100
+            self.num_classes = 100 if 'cifar100' in self.dataset.lower() else 10
             self.c_channel_size = 64
             self.g_channel_size = 64
         elif 'mnist' in self.dataset.lower():
@@ -68,8 +72,8 @@ class serverFedCIL(Server):
             self.g_channel_size = 64
 
         # --- Initialize Global WGAN Generator ---
-        # This will be imported from your gan module
-        # For now, we'll use a placeholder
+
+        # print(f"nz: {self.nz}")
         self.global_generator = self._create_wgan()
 
         # --- Optimizers ---
@@ -79,6 +83,7 @@ class serverFedCIL(Server):
         self.beta2 = getattr(args, 'beta2', 0.999)
         self.weight_decay = getattr(args, 'weight_decay', 0.0)
         self.generator_lambda = getattr(args, 'generator_lambda', 10.0)
+        self.mode='partial' if 'partial' in self.algorithm.lower() else 'all'
 
         # TODO Initialize ACGAN: Source output / Auxilary classifier.
         self._initialize_optimizers()
@@ -89,6 +94,8 @@ class serverFedCIL(Server):
 
         # Initialize clients
         self.set_clients(clientFedCIL)
+        for client in self.clients:
+            client.local_generator = self.global_generator
 
         # Track learned classes globally
         self.global_classes = []  # Changed to list for compatibility
@@ -101,21 +108,15 @@ class serverFedCIL(Server):
         Create WGAN generator
         This should import from your gan module
         """
-        # Placeholder - replace with actual WGAN from gan module
-        try:
-            from FLAlgorithms.generator.models import WGAN
-            generator = WGAN(
-                z_size=self.nz,
-                image_size=self.img_size,
-                image_channel_size=self.nc,
-                c_channel_size=self.c_channel_size,
-                g_channel_size=self.g_channel_size,
-                dataset=self.dataset
-            )
-            return generator.to(self.device)
-        except:
-            print("[Server] Warning: Could not import WGAN, using placeholder")
-            return None
+        generator = WGAN(
+            z_size=self.nz,
+            image_size=self.img_size,
+            image_channel_size=self.nc,
+            c_channel_size=self.c_channel_size,
+            g_channel_size=self.g_channel_size,
+            dataset=self.dataset
+        )
+        return generator.to(self.device)
 
     def _initialize_optimizers(self):
         """Initialize optimizers for generator"""
@@ -214,8 +215,6 @@ class serverFedCIL(Server):
 
             # --- Federated Training Rounds ---
             for round_idx in range(self.global_rounds):
-                print(f"\n--- Round {round_idx+1}/{self.global_rounds} ---")
-
                 start_time = time.time()
                 glob_iter = round_idx + self.global_rounds * task
 
@@ -223,7 +222,11 @@ class serverFedCIL(Server):
                 self.selected_clients = self.select_clients()
 
                 # Send models to clients
-                self.send_models(task, glob_iter)
+                self.send_parameters_(mode=self.mode, only_critic = False)
+
+                if round_idx%self.eval_gap == 0:
+                    print(f"\n-------------Round number: {round_idx}-------------")
+                    self.eval(task=task, glob_iter=glob_iter, flag="global")
 
                 # Client training
                 for client in self.selected_clients:
@@ -251,7 +254,8 @@ class serverFedCIL(Server):
             # Evaluate on all tasks
             self.evaluate_all_tasks(task)
 
-            print(f"\nTask {task} completed.\n")
+            print(f"\n>>> Task {task} finished. Evaluating Forgetting Rate...")
+            self.eval_task(task=task, glob_iter=task, flag="global")
 
     def _load_task_data(self, task):
         """Load new task data for all clients"""

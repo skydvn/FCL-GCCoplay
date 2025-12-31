@@ -35,9 +35,9 @@ class clientFedCIL(Client):
         # --- Dataset Configuration ---
         if 'cifar' in args.dataset.lower():
             self.img_size = 32
-            self.nz = 100 if 'cifar10' in args.dataset.lower() else 110
+            self.nz = 110 if 'cifar100' in args.dataset.lower() else 100
             self.nc = 3
-            self.num_classes = 10 if 'cifar10' in args.dataset.lower() else 100
+            self.num_classes = 100 if 'cifar100' in args.dataset.lower() else 10
         elif 'mnist' in args.dataset.lower():
             self.img_size = 28
             self.nz = 100
@@ -300,6 +300,10 @@ class clientFedCIL(Client):
             self.local_generator.generator_optimizer.step()
 
         # Return losses for logging
+        print(f"c_loss: {c_loss:.4f}, g_loss: {g_loss:.4f}",
+              f"kd_loss_d: {kd_loss_d:.4f}, kd_loss_g: {kd_loss_g:.4f}",
+              f"aux_fake: {aux_info[0]}, aux_real: {aux_info[1]}")
+
         return {
             'c_loss': c_loss.item(),
             'g_loss': g_loss.item(),
@@ -373,6 +377,7 @@ class clientFedCIL(Client):
         # Create noise with one-hot encoding
         noise_ = np.random.normal(0, 1, (batch_size, self.nz))
         class_onehot = np.zeros((batch_size, self.num_classes))
+
         class_onehot[np.arange(batch_size), label] = 1
 
         # Embed class information in noise
